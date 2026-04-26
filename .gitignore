@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Claude configuration
+.claude/
+
+# Output files (generated artifacts)
+resultado*.mp4
+resultado*.json
+
+# Videos (large binary files - use videos/.gitkeep to track the folder)
+videos/*.mp4
+!videos/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
