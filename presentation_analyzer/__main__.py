@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-CLI for presentation_analyzer.
+CLI for presentation_analyzer v2.
 
 Usage:
     python -m presentation_analyzer video.mp4
-    python -m presentation_analyzer video.mp4 --output-video resultado.mp4
-    python -m presentation_analyzer video.mp4 --output-video resultado.mp4 --fast
+    python -m presentation_analyzer video.mp4 -v resultado.mp4
+    python -m presentation_analyzer video.mp4 -v resultado.mp4 --max-persons 4
     python -m presentation_analyzer video.mp4 --json -o informe.json
 """
 
@@ -31,7 +31,7 @@ def main():
     parser.add_argument("video", help="Ruta al archivo de video")
     parser.add_argument(
         "--output-video", "-v", type=str, default=None,
-        help="Generar video anotado con esqueleto y marcas de errores (ej: resultado.mp4)"
+        help="Generar video anotado con esqueleto y marcas de errores"
     )
     parser.add_argument(
         "--json", action="store_true",
@@ -50,6 +50,10 @@ def main():
         help="Desactivar detección de manos (más rápido, sin gestos ofensivos)"
     )
     parser.add_argument(
+        "--max-persons", type=int, default=4,
+        help="Máximo de personas a rastrear simultáneamente (1-4, default: 4)"
+    )
+    parser.add_argument(
         "--max-duration", type=float, default=None,
         help="Analizar solo los primeros N segundos"
     )
@@ -64,11 +68,13 @@ def main():
         use_hands=not args.no_hands,
         model_complexity=0 if args.fast else 1,
         process_every_n=3 if args.fast else 2,
+        max_persons=min(4, max(1, args.max_persons)),
     )
 
     print(f"\n  📹 Analizando: {args.video}")
     print(f"  ⚙  Modo: {'rápido' if args.fast else 'estándar'} | "
-          f"Manos: {'sí' if not args.no_hands else 'no'}")
+          f"Manos: {'sí' if not args.no_hands else 'no'} | "
+          f"Personas: máx {config['max_persons']}")
     if args.output_video:
         print(f"  🎬 Video resultado: {args.output_video}")
     print()
@@ -82,9 +88,8 @@ def main():
         )
 
     if not args.json:
-        print()  # newline after progress bar
+        print()
 
-    # Output
     if args.json:
         output = report_to_json(report)
         if args.output:

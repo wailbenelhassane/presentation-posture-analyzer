@@ -103,15 +103,16 @@ class GestureDetector:
     """
 
     # ── tuneable thresholds ──────────────────────────────────────────────
-    CROSSED_ARMS_WRIST_DIST = 0.08      # normalised; wrists close + crossed
-    POCKET_Y_OFFSET = 0.03              # wrist below hip
-    POCKET_X_CLOSENESS = 0.10           # wrist horizontally near hip
-    FACE_TOUCH_DIST = 0.10              # wrist near nose
-    BEHIND_BACK_Z = -0.12              # wrist z behind shoulder z
-    SLOUCH_ANGLE_THRESHOLD = 155        # shoulder-hip vertical angle
-    FIDGET_SPEED_THRESHOLD = 0.025      # per-frame normalised movement
-    STATIC_ARMS_SPEED = 0.003           # too little movement
-    SUSTAINED_FRAMES_MIN = 8            # frames before reporting sustained pose
+    # NOTE: these are intentionally lenient to avoid false positives.
+    CROSSED_ARMS_WRIST_DIST = 0.06      # normalised; wrists close + crossed
+    POCKET_Y_OFFSET = 0.05              # wrist needs to be clearly below hip
+    POCKET_X_CLOSENESS = 0.07           # wrist must be very close to hip horizontally
+    FACE_TOUCH_DIST = 0.07              # wrist very near nose
+    BEHIND_BACK_Z = -0.18              # wrist z clearly behind shoulder z
+    SLOUCH_ANGLE_THRESHOLD = 145        # only flag really bad slouching
+    FIDGET_SPEED_THRESHOLD = 0.035      # tolerate more natural movement
+    STATIC_ARMS_SPEED = 0.002           # only flag truly frozen arms
+    SUSTAINED_FRAMES_MIN = 18           # ~0.6s at 30fps — must be clearly sustained
     OFFENSIVE_FINGER_RATIO = 1.8        # middle finger extended vs others
 
     def __init__(self, fps: float = 30.0):
@@ -268,7 +269,7 @@ class GestureDetector:
         detected = left_touch or right_touch
         n = self._sustain("face_touch", detected)
 
-        if n >= self.SUSTAINED_FRAMES_MIN // 2:
+        if n >= self.SUSTAINED_FRAMES_MIN:
             hl = [LM.NOSE]
             if left_touch:
                 hl.append(LM.LEFT_WRIST)
@@ -320,7 +321,7 @@ class GestureDetector:
         detected = angle < self.SLOUCH_ANGLE_THRESHOLD
         n = self._sustain("slouch", detected)
 
-        if n >= self.SUSTAINED_FRAMES_MIN * 2:
+        if n >= self.SUSTAINED_FRAMES_MIN * 3:  # ~1.8s at 30fps — clear slouch
             events.append(GestureEvent(
                 name="slouch",
                 severity=Severity.MEDIUM,
@@ -349,8 +350,8 @@ class GestureDetector:
                 std_speed = np.std(self._wrist_speeds)
 
                 is_fidget = (
-                    std_speed > self.FIDGET_SPEED_THRESHOLD * 0.5 and
-                    avg_speed > self.FIDGET_SPEED_THRESHOLD * 0.3
+                    std_speed > self.FIDGET_SPEED_THRESHOLD * 0.7 and
+                    avg_speed > self.FIDGET_SPEED_THRESHOLD * 0.5
                 )
                 n = self._sustain("fidgeting", is_fidget)
 
@@ -376,7 +377,7 @@ class GestureDetector:
         detected = avg_speed < self.STATIC_ARMS_SPEED
         n = self._sustain("static_arms", detected)
 
-        if n >= int(self.fps * 5):
+        if n >= int(self.fps * 8):  # 8 seconds of total stillness
             events.append(GestureEvent(
                 name="static_arms",
                 severity=Severity.LOW,

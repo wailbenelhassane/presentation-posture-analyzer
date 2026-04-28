@@ -1,11 +1,7 @@
 """
 Video renderer — draws skeleton, red alert circles, and event labels.
 
-Creates an annotated output video showing:
-  - Pose skeleton in green/white
-  - Red pulsing circles on problematic landmarks
-  - Event label + severity banner at the top
-  - Timestamp MM:SS overlay
+Supports multiple persons with different skeleton colors.
 """
 
 import cv2
@@ -15,7 +11,6 @@ from typing import Optional
 from .gestures import GestureEvent, Severity, LM
 
 
-# ── Skeleton connections (MediaPipe Pose) ────────────────────────────────
 POSE_CONNECTIONS = [
     (LM.NOSE, LM.LEFT_EYE), (LM.NOSE, LM.RIGHT_EYE),
     (LM.LEFT_EYE, LM.LEFT_EAR), (LM.RIGHT_EYE, LM.RIGHT_EAR),
@@ -32,11 +27,19 @@ POSE_CONNECTIONS = [
     (LM.RIGHT_HIP, LM.RIGHT_KNEE), (LM.RIGHT_KNEE, LM.RIGHT_ANKLE),
 ]
 
+# Different skeleton color per person (BGR)
+PERSON_COLORS = [
+    (180, 220, 180),   # green
+    (220, 180, 120),   # blue-ish
+    (140, 200, 220),   # warm yellow
+    (200, 160, 200),   # purple-ish
+]
+
 SEVERITY_COLORS = {
-    Severity.LOW:      (0, 200, 255),    # naranja
-    Severity.MEDIUM:   (0, 100, 255),    # rojo-naranja
-    Severity.HIGH:     (0, 0, 255),      # rojo
-    Severity.CRITICAL: (0, 0, 200),      # rojo oscuro
+    Severity.LOW:      (0, 200, 255),
+    Severity.MEDIUM:   (0, 100, 255),
+    Severity.HIGH:     (0, 0, 255),
+    Severity.CRITICAL: (0, 0, 200),
 }
 
 SEVERITY_LABELS = {
@@ -48,20 +51,14 @@ SEVERITY_LABELS = {
 
 
 def format_timestamp(seconds: float) -> str:
-    """Format seconds as MM:SS."""
     m = int(seconds) // 60
     s = int(seconds) % 60
     return f"{m:02d}:{s:02d}"
 
 
 class VideoRenderer:
-    """
-    Renders annotated video frames with skeleton and gesture highlights.
-    """
 
-    SKELETON_COLOR = (180, 220, 180)
     SKELETON_THICKNESS = 2
-    JOINT_COLOR = (255, 255, 255)
     JOINT_RADIUS = 4
     ALERT_CIRCLE_RADIUS = 28
     ALERT_CIRCLE_THICKNESS = 3
@@ -81,27 +78,48 @@ class VideoRenderer:
         if not self._writer.isOpened():
             raise RuntimeError(f"Cannot open output video: {output_path}")
 
-    def draw_frame(
+    def draw_frame_multi(
         self,
         frame: np.ndarray,
-        pose_landmarks,
-        events: list[GestureEvent],
+        frame_data: list,
         frame_idx: int,
+        events_override: Optional[list] = None,
     ) -> np.ndarray:
+        """
+        Draw skeletons and highlights for multiple persons.
+
+        Args:
+            frame: BGR frame.
+            frame_data: list of (person_id, events, smoothed_landmarks).
+            frame_idx: Frame number.
+            events_override: If set (even if empty list), use this instead
+                             of events from frame_data (for skipped frames).
+        """
         annotated = frame.copy()
 
-        if pose_landmarks is not None:
-            lm = pose_landmarks.landmark
-            self._draw_skeleton(annotated, lm)
-            self._draw_joints(annotated, lm)
+        all_events = []
 
-            for ev in events:
+        for person_id, events, landmarks in frame_data:
+            if landmarks is None:
+                continue
+
+            lm = landmarks.landmark
+            color = PERSON_COLORS[person_id % len(PERSON_COLORS)]
+
+            self._draw_skeleton(annotated, lm, color)
+            self._draw_joints(annotated, lm, color)
+
+            # Use real events or override (empty for skipped frames)
+            evts = events if events_override is None else events_override
+            for ev in evts:
                 self._draw_alert_circles(annotated, lm, ev, frame_idx)
 
-        for ev in events:
+            all_events.extend(evts)
+
+        # Register event labels
+        for ev in all_events:
             self._active_labels.append({
                 "text": ev.description,
-                "name": ev.name,
                 "severity": ev.severity,
                 "ttl": self.LABEL_FADE_FRAMES,
             })
@@ -126,21 +144,23 @@ class VideoRenderer:
             return None
         return (int(landmark.x * self.w), int(landmark.y * self.h))
 
-    def _draw_skeleton(self, frame, lm):
+    def _draw_skeleton(self, frame, lm, color):
         for (a, b) in POSE_CONNECTIONS:
             if a >= len(lm) or b >= len(lm):
                 continue
             pa = self._lm_to_px(lm[a])
             pb = self._lm_to_px(lm[b])
             if pa and pb:
-                cv2.line(frame, pa, pb, self.SKELETON_COLOR, self.SKELETON_THICKNESS,
+                cv2.line(frame, pa, pb, color, self.SKELETON_THICKNESS,
                          lineType=cv2.LINE_AA)
 
-    def _draw_joints(self, frame, lm):
+    def _draw_joints(self, frame, lm, color):
+        # Joint dots are slightly brighter than skeleton
+        joint_color = tuple(min(255, c + 40) for c in color)
         for i in range(min(29, len(lm))):
             pt = self._lm_to_px(lm[i])
             if pt:
-                cv2.circle(frame, pt, self.JOINT_RADIUS, self.JOINT_COLOR, -1,
+                cv2.circle(frame, pt, self.JOINT_RADIUS, joint_color, -1,
                            lineType=cv2.LINE_AA)
 
     def _draw_alert_circles(self, frame, lm, event: GestureEvent, frame_idx: int):
@@ -158,17 +178,14 @@ class VideoRenderer:
             if pt is None:
                 continue
 
-            # Outer pulsing circle
             cv2.circle(frame, pt, radius, color, self.ALERT_CIRCLE_THICKNESS,
                        lineType=cv2.LINE_AA)
 
-            # Semi-transparent fill for CRITICAL
             if event.severity == Severity.CRITICAL:
                 overlay = frame.copy()
                 cv2.circle(overlay, pt, radius, color, -1)
                 cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
 
-            # Inner solid dot
             cv2.circle(frame, pt, 6, color, -1, lineType=cv2.LINE_AA)
 
     def _draw_labels(self, frame):
@@ -187,13 +204,11 @@ class VideoRenderer:
         color = SEVERITY_COLORS.get(current["severity"], (0, 0, 255))
         sev_label = SEVERITY_LABELS.get(current["severity"], "")
 
-        # Banner background
         overlay = frame.copy()
         cv2.rectangle(overlay, (0, 0), (self.w, self.BANNER_HEIGHT), (0, 0, 0), -1)
         alpha = min(0.75, current["ttl"] / self.LABEL_FADE_FRAMES)
         cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
-        # Severity badge
         badge_text = f" {sev_label} "
         (tw, th), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
         cv2.rectangle(frame, (10, 8), (10 + tw + 8, 8 + th + 10), color, -1)
@@ -201,7 +216,6 @@ class VideoRenderer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
                     lineType=cv2.LINE_AA)
 
-        # Description
         text_x = 10 + tw + 20
         cv2.putText(frame, current["text"], (text_x, 33),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1,
