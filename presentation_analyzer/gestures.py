@@ -64,6 +64,21 @@ def _dist(a, b) -> float:
     return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
 
 
+def _point_to_segment_dist(p, seg_a, seg_b) -> float:
+    """Shortest distance from point p to line segment (seg_a → seg_b), in 2D normalised coords."""
+    dx = seg_b.x - seg_a.x
+    dy = seg_b.y - seg_a.y
+    len_sq = dx * dx + dy * dy
+    if len_sq < 1e-12:
+        return _dist(p, seg_a)
+    # Project p onto the segment, clamped to [0,1]
+    t = max(0.0, min(1.0, ((p.x - seg_a.x) * dx + (p.y - seg_a.y) * dy) / len_sq))
+    # Closest point on segment
+    proj_x = seg_a.x + t * dx
+    proj_y = seg_a.y + t * dy
+    return math.sqrt((p.x - proj_x) ** 2 + (p.y - proj_y) ** 2)
+
+
 def _mid(a, b):
     """Return a simple namespace with midpoint coords."""
     class P:
@@ -196,24 +211,39 @@ class GestureDetector:
         le, re = lm[LM.LEFT_ELBOW], lm[LM.RIGHT_ELBOW]
         ls, rs = lm[LM.LEFT_SHOULDER], lm[LM.RIGHT_SHOULDER]
 
-        wrists_crossed = lw.x > rw.x
-        wrists_close = _dist(lw, rw) < self.CROSSED_ARMS_WRIST_DIST * 3
+        # Both wrists and elbows must be visible
+        if min(lw.visibility, rw.visibility, le.visibility, re.visibility) < 0.5:
+            self._sustain("crossed_arms", False)
+            return
 
-        left_angle = _angle(ls, le, lw)
-        right_angle = _angle(rs, re, rw)
-        elbows_bent = left_angle < 100 and right_angle < 100
+        # ── Core: is the left wrist physically ON TOP of the right arm? ──
+        # Measure distance from left wrist to the right arm segments:
+        #   right upper arm (shoulder → elbow) and right forearm (elbow → wrist)
+        lw_to_r_upper = _point_to_segment_dist(lw, rs, re)
+        lw_to_r_fore  = _point_to_segment_dist(lw, re, rw)
+        lw_near_right_arm = min(lw_to_r_upper, lw_to_r_fore)
 
-        torso_mid_y = (ls.y + lm[LM.LEFT_HIP].y) / 2
-        wrists_at_chest = (
-            min(lw.y, rw.y) > ls.y - 0.05 and
-            max(lw.y, rw.y) < lm[LM.LEFT_HIP].y + 0.05
-        )
+        # Same for right wrist to left arm
+        rw_to_l_upper = _point_to_segment_dist(rw, ls, le)
+        rw_to_l_fore  = _point_to_segment_dist(rw, le, lw)
+        rw_near_left_arm = min(rw_to_l_upper, rw_to_l_fore)
 
-        detected = wrists_crossed and (wrists_close or elbows_bent) and wrists_at_chest
+        # Margin: scale by torso width for robustness across camera distances.
+        # Shoulder width gives a good reference for "touching distance".
+        torso_width = abs(rs.x - ls.x)
+        margin = torso_width * 0.25  # ~25% of shoulder width
+
+        left_touching_right = lw_near_right_arm < margin
+        right_touching_left = rw_near_left_arm < margin
+
+        # Need BOTH wrists on the opposite arm (one-sided is not "crossed")
+        detected = left_touching_right and right_touching_left
         n = self._sustain("crossed_arms", detected)
 
-        if n >= self.SUSTAINED_FRAMES_MIN:
-            confidence = min(1.0, n / (self.SUSTAINED_FRAMES_MIN * 3))
+        # Require 2 full seconds sustained
+        min_frames = int(self.fps * 2)
+        if n >= min_frames:
+            confidence = min(1.0, n / (min_frames * 2))
             events.append(GestureEvent(
                 name="crossed_arms",
                 severity=Severity.MEDIUM,
@@ -227,21 +257,37 @@ class GestureDetector:
     def _check_hands_in_pockets(self, lm, frame, ts, events):
         lw, rw = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
         lh, rh = lm[LM.LEFT_HIP], lm[LM.RIGHT_HIP]
+        le, re = lm[LM.LEFT_ELBOW], lm[LM.RIGHT_ELBOW]
 
-        left_in = (
-            lw.y > lh.y + self.POCKET_Y_OFFSET and
-            abs(lw.x - lh.x) < self.POCKET_X_CLOSENESS and
-            lw.visibility > 0.3
-        )
-        right_in = (
-            rw.y > rh.y + self.POCKET_Y_OFFSET and
-            abs(rw.x - rh.x) < self.POCKET_X_CLOSENESS and
-            rw.visibility > 0.3
-        )
+        # Use torso height as reference for adaptive margins
+        torso_height = abs((lh.y + rh.y) / 2 - (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y) / 2)
+        y_margin = torso_height * 0.15    # wrist can be slightly above or below hip
+        x_margin = torso_height * 0.25    # horizontal closeness to hip
+
+        # Left hand in pocket: wrist at hip level AND close to left hip horizontally
+        left_at_hip_height = abs(lw.y - lh.y) < y_margin or lw.y > lh.y
+        left_near_hip_x = abs(lw.x - lh.x) < x_margin
+        left_visible = lw.visibility > 0.2
+
+        # Also check the arm hangs down (elbow above wrist, roughly vertical)
+        left_arm_down = le.y < lw.y - 0.02
+
+        left_in = left_at_hip_height and left_near_hip_x and left_visible and left_arm_down
+
+        # Same for right
+        right_at_hip_height = abs(rw.y - rh.y) < y_margin or rw.y > rh.y
+        right_near_hip_x = abs(rw.x - rh.x) < x_margin
+        right_visible = rw.visibility > 0.2
+        right_arm_down = re.y < rw.y - 0.02
+
+        right_in = right_at_hip_height and right_near_hip_x and right_visible and right_arm_down
+
         detected = left_in or right_in
         n = self._sustain("hands_in_pockets", detected)
 
-        if n >= self.SUSTAINED_FRAMES_MIN:
+        # Require 2 seconds sustained
+        min_frames = int(self.fps * 2)
+        if n >= min_frames:
             both = left_in and right_in
             sev = Severity.HIGH if both else Severity.MEDIUM
             hl = []
@@ -252,7 +298,7 @@ class GestureDetector:
             events.append(GestureEvent(
                 name="hands_in_pockets",
                 severity=sev,
-                confidence=min(1.0, n / (self.SUSTAINED_FRAMES_MIN * 2)),
+                confidence=min(1.0, n / (min_frames * 2)),
                 frame=frame, timestamp_sec=ts,
                 description="Manos en los bolsillos — proyecta desinterés o inseguridad"
                             + (" (ambas manos)" if both else ""),
