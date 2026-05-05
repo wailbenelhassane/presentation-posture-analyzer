@@ -8,9 +8,10 @@ Main video analyzer — MediaPipe Tasks API (0.10.x+) with:
   - Optional annotated video output
 """
 
+from __future__ import annotations
+
 import cv2
 import mediapipe as mp
-import time
 import json
 import urllib.request
 from pathlib import Path
@@ -32,7 +33,7 @@ from .renderer import VideoRenderer, format_timestamp
 from .smoothing import PersonTracker, SmoothedLandmarkList
 
 
-# ── Model download ──────────────────────────────────────────────────────
+# ── Model download ──────────────────────────────────────────────────────────
 _MODEL_BASE = "https://storage.googleapis.com/mediapipe-models"
 _POSE_MODELS = {
     0: f"{_MODEL_BASE}/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
@@ -42,20 +43,23 @@ _POSE_MODELS = {
 _HAND_MODEL = f"{_MODEL_BASE}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 _MODELS_DIR = Path.home() / ".cache" / "presentation_analyzer" / "models"
 
+_POSE_COMPLEXITY_NAMES = {0: "lite", 1: "full", 2: "heavy"}
+_PROGRESS_INTERVAL = 30  # frames between progress_callback calls
+
 
 def _download_model(url: str, name: str) -> str:
     _MODELS_DIR.mkdir(parents=True, exist_ok=True)
     local_path = _MODELS_DIR / name
     if local_path.exists():
         return str(local_path)
-    print(f"  ⬇  Descargando modelo {name} (solo la primera vez)...")
+    print(f"  Descargando modelo {name} (solo la primera vez)...")
     urllib.request.urlretrieve(url, local_path)
-    print(f"  ✓  Modelo guardado en {local_path}")
+    print(f"  Modelo guardado en {local_path}")
     return str(local_path)
 
 
 class _LandmarkListAdapter:
-    """Wraps list[NormalizedLandmark] → .landmark[i] interface."""
+    """Wraps list[NormalizedLandmark] to provide the .landmark[i] interface."""
     def __init__(self, landmarks: list):
         self.landmark = landmarks
 
@@ -65,10 +69,9 @@ class PresentationAnalyzer:
     Multi-person presentation body-language analyzer with smoothing.
 
     Usage:
-        analyzer = PresentationAnalyzer()
-        report = analyzer.analyze_video("input.mp4", output_video="resultado.mp4")
+        with PresentationAnalyzer() as analyzer:
+            report = analyzer.analyze_video("input.mp4", output_video="result.mp4")
         print(f"{report.final_score}/{report.max_score} ({report.grade})")
-        # 1 person → /100, 2 persons → /200, etc.
     """
 
     def __init__(
@@ -96,39 +99,11 @@ class PresentationAnalyzer:
         self._scorer = ScoringEngine()
         self._session_active = False
         self._fps = 30.0
-        self._last_frame_data: list = []  # cached for skipped frames
+        self._last_frame_data: list = []
         self._peak_persons = 1
 
-    def _ensure_models(self):
-        if self._pose is None:
-            name_map = {0: "lite", 1: "full", 2: "heavy"}
-            model_file = f"pose_landmarker_{name_map[self._model_complexity]}.task"
-            model_path = _download_model(
-                _POSE_MODELS[self._model_complexity], model_file
-            )
-            self._pose = PoseLandmarker.create_from_options(
-                PoseLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=model_path),
-                    running_mode=RunningMode.VIDEO,
-                    min_pose_detection_confidence=self._min_det,
-                    min_tracking_confidence=self._min_track,
-                    num_poses=self._max_persons,
-                )
-            )
+    # ── Full-video API ───────────────────────────────────────────────────
 
-        if self._use_hands and self._hands is None:
-            hand_path = _download_model(_HAND_MODEL, "hand_landmarker.task")
-            self._hands = HandLandmarker.create_from_options(
-                HandLandmarkerOptions(
-                    base_options=BaseOptions(model_asset_path=hand_path),
-                    running_mode=RunningMode.VIDEO,
-                    min_hand_detection_confidence=self._min_det,
-                    min_tracking_confidence=self._min_track,
-                    num_hands=2,
-                )
-            )
-
-    # ── full video analysis ──────────────────────────────────────────────
     def analyze_video(
         self,
         video_path: str,
@@ -157,9 +132,7 @@ class PresentationAnalyzer:
             renderer.open(output_video)
 
         self.begin_session(fps=fps)
-
         frame_idx = 0
-        t_start = time.time()
 
         try:
             while cap.isOpened() and frame_idx < max_frames:
@@ -168,36 +141,26 @@ class PresentationAnalyzer:
                     break
 
                 if frame_idx % self._process_every_n == 0:
-                    frame_data = self.process_frame(frame, frame_idx)
-                    self._last_frame_data = frame_data
-
+                    self._last_frame_data = self.process_frame(frame, frame_idx)
                     if renderer:
-                        renderer.draw_frame_multi(frame, frame_data, frame_idx)
-                else:
-                    if renderer:
-                        renderer.draw_frame_multi(
-                            frame, self._last_frame_data, frame_idx,
-                            events_override=[],
-                        )
+                        renderer.draw_frame_multi(frame, self._last_frame_data, frame_idx)
+                elif renderer:
+                    renderer.draw_frame_multi(
+                        frame, self._last_frame_data, frame_idx, events_override=[]
+                    )
 
                 frame_idx += 1
-
-                if progress_callback and frame_idx % 30 == 0:
+                if progress_callback and frame_idx % _PROGRESS_INTERVAL == 0:
                     progress_callback(min(1.0, frame_idx / max_frames))
-
         finally:
             cap.release()
             if renderer:
                 renderer.close()
 
-        report = self.end_session()
+        return self.end_session()
 
-        elapsed = time.time() - t_start
-        report._processing_fps = round(frame_idx / elapsed if elapsed > 0 else 0, 1)
+    # ── Frame-by-frame API ───────────────────────────────────────────────
 
-        return report
-
-    # ── frame-by-frame API ───────────────────────────────────────────────
     def begin_session(self, fps: float = 30.0):
         self._ensure_models()
         self._fps = fps
@@ -213,8 +176,7 @@ class PresentationAnalyzer:
         """
         Process a single BGR frame.
 
-        Returns:
-            list of (person_id, events, smoothed_landmarks) tuples.
+        Returns list of (person_id, events, smoothed_landmarks) tuples.
         """
         if not self._session_active:
             raise RuntimeError("Call begin_session() first")
@@ -223,55 +185,31 @@ class PresentationAnalyzer:
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         timestamp_ms = int(frame_idx * 1000 / self._fps)
 
-        # ── Pose detection (multi-person) ────────────────────────────
         pose_result = self._pose.detect_for_video(mp_image, timestamp_ms)
-
-        if not pose_result.pose_landmarks or len(pose_result.pose_landmarks) == 0:
+        if not pose_result.pose_landmarks:
             return []
 
-        # ── Match detections to tracked persons ──────────────────────
         assignments = self._tracker.match(pose_result.pose_landmarks)
-
-        # Update peak person count for scoring
         if len(assignments) > self._peak_persons:
             self._peak_persons = len(assignments)
             self._scorer.set_num_persons(self._peak_persons)
 
-        # ── Optional hand detection ──────────────────────────────────
-        hand_results = None
-        if self._use_hands and self._hands:
-            hands_result = self._hands.detect_for_video(mp_image, timestamp_ms)
-            if hands_result.hand_landmarks and len(hands_result.hand_landmarks) > 0:
-                hand_results = [
-                    _LandmarkListAdapter(hand_lm)
-                    for hand_lm in hands_result.hand_landmarks
-                ]
+        hand_results = self._detect_hands(mp_image, timestamp_ms)
 
-        # ── Per-person: smooth → detect → score ─────────────────────
         frame_data = []
         for person_id, raw_landmarks in assignments:
-            # Get or create smoother + detector for this person
             smoother = self._tracker.get_smoother(person_id)
             if person_id not in self._detectors:
                 self._detectors[person_id] = GestureDetector(fps=self._fps)
 
-            detector = self._detectors[person_id]
-
-            # Smooth landmarks
-            smoothed = smoother.smooth(raw_landmarks)
-            smoothed_lm = SmoothedLandmarkList(smoothed)
-
-            # Detect gestures on smoothed data
-            events = detector.detect(
-                smoothed_lm,
+            smoothed = SmoothedLandmarkList(smoother.smooth(raw_landmarks))
+            events = self._detectors[person_id].detect(
+                smoothed,
                 hand_landmarks_list=hand_results,
                 frame_idx=frame_idx,
             )
-
-            # Feed to scorer with person_id
             self._scorer.add_events(events, frame_idx, person_id=person_id)
-
-            frame_data.append((person_id, events, smoothed_lm))
+            frame_data.append((person_id, events, smoothed))
 
         return frame_data
 
@@ -291,11 +229,52 @@ class PresentationAnalyzer:
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *_):
         self.close()
 
+    # ── Model initialisation ─────────────────────────────────────────────
 
-# ── convenience helpers ──────────────────────────────────────────────────
+    def _ensure_models(self):
+        if self._pose is None:
+            self._pose = self._create_pose_model()
+        if self._use_hands and self._hands is None:
+            self._hands = self._create_hand_model()
+
+    def _create_pose_model(self) -> PoseLandmarker:
+        model_file = f"pose_landmarker_{_POSE_COMPLEXITY_NAMES[self._model_complexity]}.task"
+        model_path = _download_model(_POSE_MODELS[self._model_complexity], model_file)
+        return PoseLandmarker.create_from_options(
+            PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=model_path),
+                running_mode=RunningMode.VIDEO,
+                min_pose_detection_confidence=self._min_det,
+                min_tracking_confidence=self._min_track,
+                num_poses=self._max_persons,
+            )
+        )
+
+    def _create_hand_model(self) -> HandLandmarker:
+        hand_path = _download_model(_HAND_MODEL, "hand_landmarker.task")
+        return HandLandmarker.create_from_options(
+            HandLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=hand_path),
+                running_mode=RunningMode.VIDEO,
+                min_hand_detection_confidence=self._min_det,
+                min_tracking_confidence=self._min_track,
+                num_hands=2,
+            )
+        )
+
+    def _detect_hands(self, mp_image, timestamp_ms: int) -> Optional[list]:
+        if not (self._use_hands and self._hands):
+            return None
+        result = self._hands.detect_for_video(mp_image, timestamp_ms)
+        if result.hand_landmarks:
+            return [_LandmarkListAdapter(hl) for hl in result.hand_landmarks]
+        return None
+
+
+# ── Convenience helpers ──────────────────────────────────────────────────────
 
 def report_to_dict(report: ScoreReport) -> dict:
     d = asdict(report)
@@ -313,11 +292,9 @@ def report_to_json(report: ScoreReport, indent: int = 2) -> str:
 
 
 def print_report(report: ScoreReport):
-    persons_str = (f" ({report.num_persons} personas)"
-                   if report.num_persons > 1 else "")
+    persons_str = f" ({report.num_persons} personas)" if report.num_persons > 1 else ""
     print(f"\n{'='*60}")
-    print(f"  PUNTUACIÓN: {report.final_score}/{report.max_score}  "
-          f"({report.grade}){persons_str}")
+    print(f"  PUNTUACIÓN: {report.final_score}/{report.max_score}  ({report.grade}){persons_str}")
     print(f"  Duración: {format_timestamp(report.video_duration_sec)} | "
           f"Frames: {report.total_frames_analyzed}")
     print(f"{'='*60}\n")
@@ -329,11 +306,10 @@ def print_report(report: ScoreReport):
             first = format_timestamp(gs.first_seen_sec)
             last = format_timestamp(gs.last_seen_sec)
             times = first if gs.first_seen_sec == gs.last_seen_sec else f"{first} → {last}"
-
-            print(f"  ⚠ {gs.name:<22} -{gs.points_deducted:>5.1f} pts  "
+            print(f"  ! {gs.name:<22} -{gs.points_deducted:>5.1f} pts  "
                   f"({gs.total_occurrences}x, {gs.total_seconds}s)")
             print(f"    {gs.description}")
-            print(f"    📍 Momento: {times}")
+            print(f"    Momento: {times}")
         print()
 
     if report.timeline:

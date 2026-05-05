@@ -7,25 +7,26 @@ Detects problematic presentation gestures:
 - Offensive gestures (middle finger via hand landmarks)
 - Fidgeting / nervous movements
 - Touching face or hair
-- Closed/tense fists
 - Arms too rigid (no gesturing)
 - Slouching / poor posture
 - Hands behind back
 """
 
 import math
-import numpy as np
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from types import SimpleNamespace
 from typing import Optional
+
+import numpy as np
 
 
 class Severity(Enum):
-    """How severely a gesture impacts the score."""
-    LOW = 1        # Minor issue (e.g., slightly rigid arms)
-    MEDIUM = 3     # Noticeable problem (e.g., crossed arms)
-    HIGH = 5       # Serious issue (e.g., hands in pockets for long)
-    CRITICAL = 15  # Offensive or very damaging (e.g., middle finger)
+    LOW = 1
+    MEDIUM = 3
+    HIGH = 5
+    CRITICAL = 15
 
 
 @dataclass
@@ -33,160 +34,156 @@ class GestureEvent:
     """A detected gesture occurrence."""
     name: str
     severity: Severity
-    confidence: float       # 0.0 - 1.0
+    confidence: float
     frame: int
     timestamp_sec: float
     description: str
     sustained_frames: int = 1
-    highlight_landmarks: list = field(default_factory=list)  # pose landmark indices to circle in red
+    highlight_landmarks: list[int] = field(default_factory=list)
 
 
-# ── MediaPipe Pose landmark indices ──────────────────────────────────────────
-# Reference: https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
 class LM:
-    NOSE = 0
-    LEFT_EYE_INNER = 1; LEFT_EYE = 2; LEFT_EYE_OUTER = 3
-    RIGHT_EYE_INNER = 4; RIGHT_EYE = 5; RIGHT_EYE_OUTER = 6
-    LEFT_EAR = 7; RIGHT_EAR = 8
-    MOUTH_LEFT = 9; MOUTH_RIGHT = 10
-    LEFT_SHOULDER = 11; RIGHT_SHOULDER = 12
-    LEFT_ELBOW = 13; RIGHT_ELBOW = 14
-    LEFT_WRIST = 15; RIGHT_WRIST = 16
-    LEFT_PINKY = 17; RIGHT_PINKY = 18
-    LEFT_INDEX = 19; RIGHT_INDEX = 20
-    LEFT_THUMB = 21; RIGHT_THUMB = 22
-    LEFT_HIP = 23; RIGHT_HIP = 24
-    LEFT_KNEE = 25; RIGHT_KNEE = 26
-    LEFT_ANKLE = 27; RIGHT_ANKLE = 28
+    """MediaPipe Pose landmark indices.
 
+    Reference: https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
+    """
+    NOSE = 0
+    LEFT_EYE_INNER = 1
+    LEFT_EYE = 2
+    LEFT_EYE_OUTER = 3
+    RIGHT_EYE_INNER = 4
+    RIGHT_EYE = 5
+    RIGHT_EYE_OUTER = 6
+    LEFT_EAR = 7
+    RIGHT_EAR = 8
+    MOUTH_LEFT = 9
+    MOUTH_RIGHT = 10
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW = 13
+    RIGHT_ELBOW = 14
+    LEFT_WRIST = 15
+    RIGHT_WRIST = 16
+    LEFT_PINKY = 17
+    RIGHT_PINKY = 18
+    LEFT_INDEX = 19
+    RIGHT_INDEX = 20
+    LEFT_THUMB = 21
+    RIGHT_THUMB = 22
+    LEFT_HIP = 23
+    RIGHT_HIP = 24
+    LEFT_KNEE = 25
+    RIGHT_KNEE = 26
+    LEFT_ANKLE = 27
+    RIGHT_ANKLE = 28
+
+
+# ── Geometry helpers ──────────────────────────────────────────────────────────
 
 def _dist(a, b) -> float:
     return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
 
 
+def _mid(a, b):
+    return SimpleNamespace(x=(a.x + b.x) / 2, y=(a.y + b.y) / 2, z=(a.z + b.z) / 2)
+
+
 def _point_to_segment_dist(p, seg_a, seg_b) -> float:
-    """Shortest distance from point p to line segment (seg_a → seg_b), in 2D normalised coords."""
+    """Shortest 2D distance from point p to segment (seg_a → seg_b)."""
     dx = seg_b.x - seg_a.x
     dy = seg_b.y - seg_a.y
     len_sq = dx * dx + dy * dy
     if len_sq < 1e-12:
         return _dist(p, seg_a)
-    # Project p onto the segment, clamped to [0,1]
     t = max(0.0, min(1.0, ((p.x - seg_a.x) * dx + (p.y - seg_a.y) * dy) / len_sq))
-    # Closest point on segment
-    proj_x = seg_a.x + t * dx
-    proj_y = seg_a.y + t * dy
-    return math.sqrt((p.x - proj_x) ** 2 + (p.y - proj_y) ** 2)
-
-
-def _mid(a, b):
-    """Return a simple namespace with midpoint coords."""
-    class P:
-        pass
-    p = P()
-    p.x = (a.x + b.x) / 2
-    p.y = (a.y + b.y) / 2
-    p.z = (a.z + b.z) / 2
-    return p
+    return math.sqrt((p.x - seg_a.x - t * dx) ** 2 + (p.y - seg_a.y - t * dy) ** 2)
 
 
 def _angle(a, b, c) -> float:
-    """Angle at point b formed by segments ba and bc, in degrees."""
+    """Angle at point b in the a–b–c triangle, in degrees."""
     ba = (a.x - b.x, a.y - b.y)
     bc = (c.x - b.x, c.y - b.y)
     dot = ba[0] * bc[0] + ba[1] * bc[1]
     mag_ba = math.sqrt(ba[0] ** 2 + ba[1] ** 2) + 1e-9
     mag_bc = math.sqrt(bc[0] ** 2 + bc[1] ** 2) + 1e-9
-    cos_angle = max(-1, min(1, dot / (mag_ba * mag_bc)))
-    return math.degrees(math.acos(cos_angle))
+    return math.degrees(math.acos(max(-1.0, min(1.0, dot / (mag_ba * mag_bc)))))
 
+
+# ── Visibility ────────────────────────────────────────────────────────────────
 
 class VisibilityMode(Enum):
-    """What portion of the body is visible."""
     FULL_BODY = "full_body"
-    HALF_BODY = "half_body"      # waist up
-    UPPER_ONLY = "upper_only"    # shoulders/head only
+    HALF_BODY = "half_body"
+    UPPER_ONLY = "upper_only"
     UNKNOWN = "unknown"
 
 
+# ── Detector ──────────────────────────────────────────────────────────────────
+
 class GestureDetector:
     """
-    Stateful detector that tracks gestures across frames.
+    Stateful per-person gesture detector.
 
-    Keeps a small rolling buffer to detect sustained poses and fidgeting.
-    Memory footprint: ~50 KB for a 30 fps / 10-min video.
+    Keeps a rolling wrist-speed buffer to detect sustained poses and fidgeting.
+    Call detect() once per processed frame.
     """
 
-    # ── tuneable thresholds ──────────────────────────────────────────────
-    # NOTE: these are intentionally lenient to avoid false positives.
-    CROSSED_ARMS_WRIST_DIST = 0.06      # normalised; wrists close + crossed
-    POCKET_Y_OFFSET = 0.05              # wrist needs to be clearly below hip
-    POCKET_X_CLOSENESS = 0.07           # wrist must be very close to hip horizontally
-    FACE_TOUCH_DIST = 0.07              # wrist very near nose
-    BEHIND_BACK_Z = -0.18              # wrist z clearly behind shoulder z
-    SLOUCH_ANGLE_THRESHOLD = 145        # only flag really bad slouching
-    FIDGET_SPEED_THRESHOLD = 0.035      # tolerate more natural movement
-    STATIC_ARMS_SPEED = 0.002           # only flag truly frozen arms
-    SUSTAINED_FRAMES_MIN = 18           # ~0.6s at 30fps — must be clearly sustained
-    OFFENSIVE_FINGER_RATIO = 1.8        # middle finger extended vs others
+    FACE_TOUCH_DIST = 0.07
+    BEHIND_BACK_Z = -0.18
+    SLOUCH_ANGLE_THRESHOLD = 145
+    FIDGET_SPEED_THRESHOLD = 0.035
+    STATIC_ARMS_SPEED = 0.002
+    SUSTAINED_FRAMES_MIN = 18
 
     def __init__(self, fps: float = 30.0):
         self.fps = fps
         self._prev_wrists: Optional[list] = None
-        self._wrist_speeds: list[float] = []       # rolling window
-        self._speed_window = int(fps * 2)           # 2-second window
-        self._sustained: dict[str, int] = {}        # gesture_name -> frame_count
+        self._speed_window = int(fps * 2)
+        self._wrist_speeds: deque[float] = deque(maxlen=self._speed_window)
+        self._sustained: dict[str, int] = {}
 
-    # ── public API ───────────────────────────────────────────────────────
+    # ── Public API ───────────────────────────────────────────────────────
+
     def detect(
         self,
         pose_landmarks,
         hand_landmarks_list: Optional[list] = None,
         frame_idx: int = 0,
     ) -> list[GestureEvent]:
-        """
-        Run all detectors on a single frame.
-
-        Args:
-            pose_landmarks: MediaPipe Pose result (NormalizedLandmarkList).
-            hand_landmarks_list: Optional list of hand NormalizedLandmarkList
-                                 from MediaPipe Hands (for offensive gesture detection).
-            frame_idx: Current frame number.
-
-        Returns:
-            List of GestureEvent detected this frame.
-        """
         lm = pose_landmarks.landmark
         ts = frame_idx / self.fps
-        vis = self._detect_visibility(lm)
+        vis = self._visibility(lm)
         events: list[GestureEvent] = []
 
-        # --- posture checks (always available with upper body) ---
         self._check_crossed_arms(lm, frame_idx, ts, events)
         self._check_face_touch(lm, frame_idx, ts, events)
         self._check_hands_behind_back(lm, frame_idx, ts, events)
         self._check_slouch(lm, frame_idx, ts, events)
         self._check_fidgeting(lm, frame_idx, ts, events)
-        self._check_static_arms(lm, frame_idx, ts, events)
+        self._check_static_arms(frame_idx, ts, events)
 
-        # --- pocket detection only if hips visible ---
         if vis in (VisibilityMode.FULL_BODY, VisibilityMode.HALF_BODY):
             self._check_hands_in_pockets(lm, frame_idx, ts, events)
 
-        # --- offensive gestures if hand landmarks provided ---
         if hand_landmarks_list:
             self._check_offensive_gesture(hand_landmarks_list, frame_idx, ts, events)
 
         return events
 
     def detect_visibility(self, pose_landmarks) -> VisibilityMode:
-        return self._detect_visibility(pose_landmarks.landmark)
+        return self._visibility(pose_landmarks.landmark)
 
-    # ── visibility detection ─────────────────────────────────────────────
-    def _detect_visibility(self, lm) -> VisibilityMode:
+    def reset(self):
+        self._prev_wrists = None
+        self._wrist_speeds.clear()
+        self._sustained.clear()
+
+    # ── Visibility ───────────────────────────────────────────────────────
+
+    def _visibility(self, lm) -> VisibilityMode:
+        shoulder_vis = min(lm[LM.LEFT_SHOULDER].visibility, lm[LM.RIGHT_SHOULDER].visibility)
         hip_vis = min(lm[LM.LEFT_HIP].visibility, lm[LM.RIGHT_HIP].visibility)
         knee_vis = min(lm[LM.LEFT_KNEE].visibility, lm[LM.RIGHT_KNEE].visibility)
-        shoulder_vis = min(lm[LM.LEFT_SHOULDER].visibility, lm[LM.RIGHT_SHOULDER].visibility)
 
         if shoulder_vis < 0.5:
             return VisibilityMode.UNKNOWN
@@ -196,115 +193,90 @@ class GestureDetector:
             return VisibilityMode.HALF_BODY
         return VisibilityMode.FULL_BODY
 
-    # ── individual gesture detectors ─────────────────────────────────────
+    # ── Sustained-frame tracking ─────────────────────────────────────────
 
     def _sustain(self, name: str, detected: bool) -> int:
-        """Track how many consecutive frames a gesture has been active."""
-        if detected:
-            self._sustained[name] = self._sustained.get(name, 0) + 1
-        else:
-            self._sustained[name] = 0
-        return self._sustained[name]
+        count = (self._sustained.get(name, 0) + 1) if detected else 0
+        self._sustained[name] = count
+        return count
+
+    # ── Individual gesture detectors ─────────────────────────────────────
 
     def _check_crossed_arms(self, lm, frame, ts, events):
         lw, rw = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
         le, re = lm[LM.LEFT_ELBOW], lm[LM.RIGHT_ELBOW]
         ls, rs = lm[LM.LEFT_SHOULDER], lm[LM.RIGHT_SHOULDER]
 
-        # Both wrists and elbows must be visible
         if min(lw.visibility, rw.visibility, le.visibility, re.visibility) < 0.5:
             self._sustain("crossed_arms", False)
             return
 
-        # ── Core: is the left wrist physically ON TOP of the right arm? ──
-        # Measure distance from left wrist to the right arm segments:
-        #   right upper arm (shoulder → elbow) and right forearm (elbow → wrist)
-        lw_to_r_upper = _point_to_segment_dist(lw, rs, re)
-        lw_to_r_fore  = _point_to_segment_dist(lw, re, rw)
-        lw_near_right_arm = min(lw_to_r_upper, lw_to_r_fore)
-
-        # Same for right wrist to left arm
-        rw_to_l_upper = _point_to_segment_dist(rw, ls, le)
-        rw_to_l_fore  = _point_to_segment_dist(rw, le, lw)
-        rw_near_left_arm = min(rw_to_l_upper, rw_to_l_fore)
-
-        # Margin: scale by torso width for robustness across camera distances.
-        # Shoulder width gives a good reference for "touching distance".
         torso_width = abs(rs.x - ls.x)
-        margin = torso_width * 0.25  # ~25% of shoulder width
+        margin = torso_width * 0.25
 
-        left_touching_right = lw_near_right_arm < margin
-        right_touching_left = rw_near_left_arm < margin
+        lw_near_right_arm = min(
+            _point_to_segment_dist(lw, rs, re),
+            _point_to_segment_dist(lw, re, rw),
+        )
+        rw_near_left_arm = min(
+            _point_to_segment_dist(rw, ls, le),
+            _point_to_segment_dist(rw, le, lw),
+        )
 
-        # Need BOTH wrists on the opposite arm (one-sided is not "crossed")
-        detected = left_touching_right and right_touching_left
-        n = self._sustain("crossed_arms", detected)
-
-        # Require 2 full seconds sustained
+        n = self._sustain("crossed_arms", lw_near_right_arm < margin and rw_near_left_arm < margin)
         min_frames = int(self.fps * 2)
-        if n >= min_frames:
-            confidence = min(1.0, n / (min_frames * 2))
-            events.append(GestureEvent(
-                name="crossed_arms",
-                severity=Severity.MEDIUM,
-                confidence=confidence,
-                frame=frame, timestamp_sec=ts,
-                description="Brazos cruzados — transmite actitud defensiva o cerrada",
-                sustained_frames=n,
-                highlight_landmarks=[LM.LEFT_WRIST, LM.RIGHT_WRIST, LM.LEFT_ELBOW, LM.RIGHT_ELBOW],
-            ))
+        if n < min_frames:
+            return
+
+        events.append(GestureEvent(
+            name="crossed_arms",
+            severity=Severity.MEDIUM,
+            confidence=min(1.0, n / (min_frames * 2)),
+            frame=frame, timestamp_sec=ts,
+            description="Brazos cruzados — transmite actitud defensiva o cerrada",
+            sustained_frames=n,
+            highlight_landmarks=[LM.LEFT_WRIST, LM.RIGHT_WRIST, LM.LEFT_ELBOW, LM.RIGHT_ELBOW],
+        ))
 
     def _check_hands_in_pockets(self, lm, frame, ts, events):
         lw, rw = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
         lh, rh = lm[LM.LEFT_HIP], lm[LM.RIGHT_HIP]
         le, re = lm[LM.LEFT_ELBOW], lm[LM.RIGHT_ELBOW]
 
-        # Use torso height as reference for adaptive margins
-        torso_height = abs((lh.y + rh.y) / 2 - (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y) / 2)
-        y_margin = torso_height * 0.15    # wrist can be slightly above or below hip
-        x_margin = torso_height * 0.25    # horizontal closeness to hip
+        shoulder_y = (lm[LM.LEFT_SHOULDER].y + lm[LM.RIGHT_SHOULDER].y) / 2
+        torso_height = abs((lh.y + rh.y) / 2 - shoulder_y)
 
-        # Left hand in pocket: wrist at hip level AND close to left hip horizontally
-        left_at_hip_height = abs(lw.y - lh.y) < y_margin or lw.y > lh.y
-        left_near_hip_x = abs(lw.x - lh.x) < x_margin
-        left_visible = lw.visibility > 0.2
+        left_in = self._wrist_at_hip(lw, le, lh, torso_height)
+        right_in = self._wrist_at_hip(rw, re, rh, torso_height)
 
-        # Also check the arm hangs down (elbow above wrist, roughly vertical)
-        left_arm_down = le.y < lw.y - 0.02
-
-        left_in = left_at_hip_height and left_near_hip_x and left_visible and left_arm_down
-
-        # Same for right
-        right_at_hip_height = abs(rw.y - rh.y) < y_margin or rw.y > rh.y
-        right_near_hip_x = abs(rw.x - rh.x) < x_margin
-        right_visible = rw.visibility > 0.2
-        right_arm_down = re.y < rw.y - 0.02
-
-        right_in = right_at_hip_height and right_near_hip_x and right_visible and right_arm_down
-
-        detected = left_in or right_in
-        n = self._sustain("hands_in_pockets", detected)
-
-        # Require 2 seconds sustained
+        n = self._sustain("hands_in_pockets", left_in or right_in)
         min_frames = int(self.fps * 2)
-        if n >= min_frames:
-            both = left_in and right_in
-            sev = Severity.HIGH if both else Severity.MEDIUM
-            hl = []
-            if left_in:
-                hl.append(LM.LEFT_WRIST)
-            if right_in:
-                hl.append(LM.RIGHT_WRIST)
-            events.append(GestureEvent(
-                name="hands_in_pockets",
-                severity=sev,
-                confidence=min(1.0, n / (min_frames * 2)),
-                frame=frame, timestamp_sec=ts,
-                description="Manos en los bolsillos — proyecta desinterés o inseguridad"
-                            + (" (ambas manos)" if both else ""),
-                sustained_frames=n,
-                highlight_landmarks=hl,
-            ))
+        if n < min_frames:
+            return
+
+        both = left_in and right_in
+        hl = ([LM.LEFT_WRIST] if left_in else []) + ([LM.RIGHT_WRIST] if right_in else [])
+        events.append(GestureEvent(
+            name="hands_in_pockets",
+            severity=Severity.HIGH if both else Severity.MEDIUM,
+            confidence=min(1.0, n / (min_frames * 2)),
+            frame=frame, timestamp_sec=ts,
+            description="Manos en los bolsillos — proyecta desinterés o inseguridad"
+                        + (" (ambas manos)" if both else ""),
+            sustained_frames=n,
+            highlight_landmarks=hl,
+        ))
+
+    @staticmethod
+    def _wrist_at_hip(wrist, elbow, hip, torso_height: float) -> bool:
+        y_margin = torso_height * 0.15
+        x_margin = torso_height * 0.25
+        return (
+            (abs(wrist.y - hip.y) < y_margin or wrist.y > hip.y)
+            and abs(wrist.x - hip.x) < x_margin
+            and wrist.visibility > 0.2
+            and elbow.y < wrist.y - 0.02
+        )
 
     def _check_face_touch(self, lm, frame, ts, events):
         nose = lm[LM.NOSE]
@@ -312,24 +284,20 @@ class GestureDetector:
 
         left_touch = _dist(lw, nose) < self.FACE_TOUCH_DIST
         right_touch = _dist(rw, nose) < self.FACE_TOUCH_DIST
-        detected = left_touch or right_touch
-        n = self._sustain("face_touch", detected)
+        n = self._sustain("face_touch", left_touch or right_touch)
+        if n < self.SUSTAINED_FRAMES_MIN:
+            return
 
-        if n >= self.SUSTAINED_FRAMES_MIN:
-            hl = [LM.NOSE]
-            if left_touch:
-                hl.append(LM.LEFT_WRIST)
-            if right_touch:
-                hl.append(LM.RIGHT_WRIST)
-            events.append(GestureEvent(
-                name="face_touch",
-                severity=Severity.LOW,
-                confidence=min(1.0, n / self.SUSTAINED_FRAMES_MIN),
-                frame=frame, timestamp_sec=ts,
-                description="Tocarse la cara/pelo — señal de nerviosismo",
-                sustained_frames=n,
-                highlight_landmarks=hl,
-            ))
+        hl = ([LM.LEFT_WRIST] if left_touch else []) + ([LM.RIGHT_WRIST] if right_touch else [])
+        events.append(GestureEvent(
+            name="face_touch",
+            severity=Severity.LOW,
+            confidence=min(1.0, n / self.SUSTAINED_FRAMES_MIN),
+            frame=frame, timestamp_sec=ts,
+            description="Tocarse la cara/pelo — señal de nerviosismo",
+            sustained_frames=n,
+            highlight_landmarks=[LM.NOSE] + hl,
+        ))
 
     def _check_hands_behind_back(self, lm, frame, ts, events):
         lw, rw = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
@@ -337,19 +305,19 @@ class GestureDetector:
 
         left_behind = lw.z < ls.z + self.BEHIND_BACK_Z and lw.visibility < 0.4
         right_behind = rw.z < rs.z + self.BEHIND_BACK_Z and rw.visibility < 0.4
-        detected = left_behind and right_behind
-        n = self._sustain("hands_behind_back", detected)
+        n = self._sustain("hands_behind_back", left_behind and right_behind)
+        if n < self.SUSTAINED_FRAMES_MIN:
+            return
 
-        if n >= self.SUSTAINED_FRAMES_MIN:
-            events.append(GestureEvent(
-                name="hands_behind_back",
-                severity=Severity.MEDIUM,
-                confidence=min(1.0, n / (self.SUSTAINED_FRAMES_MIN * 2)),
-                frame=frame, timestamp_sec=ts,
-                description="Manos detrás de la espalda — oculta lenguaje corporal",
-                sustained_frames=n,
-                highlight_landmarks=[LM.LEFT_WRIST, LM.RIGHT_WRIST],
-            ))
+        events.append(GestureEvent(
+            name="hands_behind_back",
+            severity=Severity.MEDIUM,
+            confidence=min(1.0, n / (self.SUSTAINED_FRAMES_MIN * 2)),
+            frame=frame, timestamp_sec=ts,
+            description="Manos detrás de la espalda — oculta lenguaje corporal",
+            sustained_frames=n,
+            highlight_landmarks=[LM.LEFT_WRIST, LM.RIGHT_WRIST],
+        ))
 
     def _check_slouch(self, lm, frame, ts, events):
         ls, rs = lm[LM.LEFT_SHOULDER], lm[LM.RIGHT_SHOULDER]
@@ -359,24 +327,20 @@ class GestureDetector:
             self._sustain("slouch", False)
             return
 
-        mid_shoulder = _mid(ls, rs)
-        mid_hip = _mid(lh, rh)
-        nose = lm[LM.NOSE]
+        angle = _angle(lm[LM.NOSE], _mid(ls, rs), _mid(lh, rh))
+        n = self._sustain("slouch", angle < self.SLOUCH_ANGLE_THRESHOLD)
+        if n < self.SUSTAINED_FRAMES_MIN * 3:
+            return
 
-        angle = _angle(nose, mid_shoulder, mid_hip)
-        detected = angle < self.SLOUCH_ANGLE_THRESHOLD
-        n = self._sustain("slouch", detected)
-
-        if n >= self.SUSTAINED_FRAMES_MIN * 3:  # ~1.8s at 30fps — clear slouch
-            events.append(GestureEvent(
-                name="slouch",
-                severity=Severity.MEDIUM,
-                confidence=min(1.0, n / (self.SUSTAINED_FRAMES_MIN * 4)),
-                frame=frame, timestamp_sec=ts,
-                description="Postura encorvada — reduce presencia y autoridad",
-                sustained_frames=n,
-                highlight_landmarks=[LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER, LM.NOSE],
-            ))
+        events.append(GestureEvent(
+            name="slouch",
+            severity=Severity.MEDIUM,
+            confidence=min(1.0, n / (self.SUSTAINED_FRAMES_MIN * 4)),
+            frame=frame, timestamp_sec=ts,
+            description="Postura encorvada — reduce presencia y autoridad",
+            sustained_frames=n,
+            highlight_landmarks=[LM.LEFT_SHOULDER, LM.RIGHT_SHOULDER, LM.NOSE],
+        ))
 
     def _check_fidgeting(self, lm, frame, ts, events):
         lw, rw = lm[LM.LEFT_WRIST], lm[LM.RIGHT_WRIST]
@@ -388,19 +352,15 @@ class GestureDetector:
                 for c, p in zip(current, self._prev_wrists)
             ) / 2
             self._wrist_speeds.append(speed)
-            if len(self._wrist_speeds) > self._speed_window:
-                self._wrist_speeds.pop(0)
 
             if len(self._wrist_speeds) >= self._speed_window // 2:
-                avg_speed = np.mean(self._wrist_speeds)
-                std_speed = np.std(self._wrist_speeds)
-
+                avg_speed = float(np.mean(self._wrist_speeds))
+                std_speed = float(np.std(self._wrist_speeds))
                 is_fidget = (
-                    std_speed > self.FIDGET_SPEED_THRESHOLD * 0.7 and
-                    avg_speed > self.FIDGET_SPEED_THRESHOLD * 0.5
+                    std_speed > self.FIDGET_SPEED_THRESHOLD * 0.7
+                    and avg_speed > self.FIDGET_SPEED_THRESHOLD * 0.5
                 )
                 n = self._sustain("fidgeting", is_fidget)
-
                 if n >= self._speed_window // 2:
                     events.append(GestureEvent(
                         name="fidgeting",
@@ -414,41 +374,32 @@ class GestureDetector:
 
         self._prev_wrists = current
 
-    def _check_static_arms(self, lm, frame, ts, events):
-        """Detect overly rigid arms (no gesturing at all)."""
+    def _check_static_arms(self, frame, ts, events):
         if len(self._wrist_speeds) < self._speed_window:
             return
 
-        avg_speed = np.mean(self._wrist_speeds[-self._speed_window:])
-        detected = avg_speed < self.STATIC_ARMS_SPEED
-        n = self._sustain("static_arms", detected)
+        avg_speed = float(np.mean(self._wrist_speeds))
+        n = self._sustain("static_arms", avg_speed < self.STATIC_ARMS_SPEED)
+        if n < int(self.fps * 8):
+            return
 
-        if n >= int(self.fps * 8):  # 8 seconds of total stillness
-            events.append(GestureEvent(
-                name="static_arms",
-                severity=Severity.LOW,
-                confidence=min(1.0, n / (self.fps * 10)),
-                frame=frame, timestamp_sec=ts,
-                description="Brazos estáticos — gesticular refuerza el mensaje",
-                sustained_frames=n,
-                highlight_landmarks=[LM.LEFT_WRIST, LM.RIGHT_WRIST, LM.LEFT_ELBOW, LM.RIGHT_ELBOW],
-            ))
+        events.append(GestureEvent(
+            name="static_arms",
+            severity=Severity.LOW,
+            confidence=min(1.0, n / (self.fps * 10)),
+            frame=frame, timestamp_sec=ts,
+            description="Brazos estáticos — gesticular refuerza el mensaje",
+            sustained_frames=n,
+            highlight_landmarks=[LM.LEFT_WRIST, LM.RIGHT_WRIST, LM.LEFT_ELBOW, LM.RIGHT_ELBOW],
+        ))
 
     def _check_offensive_gesture(self, hand_landmarks_list, frame, ts, events):
-        """
-        Detect middle finger using MediaPipe Hand landmarks.
-        Middle finger extended while others are curled.
-        """
         for hand_lm in hand_landmarks_list:
             lm = hand_lm.landmark
-
-            def is_extended(tip_idx, pip_idx):
-                return lm[tip_idx].y < lm[pip_idx].y
-
-            middle_ext = is_extended(12, 10)
-            index_ext = is_extended(8, 6)
-            ring_ext = is_extended(16, 14)
-            pinky_ext = is_extended(20, 18)
+            middle_ext = self._finger_extended(lm, 12, 10)
+            index_ext = self._finger_extended(lm, 8, 6)
+            ring_ext = self._finger_extended(lm, 16, 14)
+            pinky_ext = self._finger_extended(lm, 20, 18)
 
             if middle_ext and not index_ext and not ring_ext and not pinky_ext:
                 events.append(GestureEvent(
@@ -461,8 +412,6 @@ class GestureDetector:
                     highlight_landmarks=[LM.LEFT_WRIST, LM.RIGHT_WRIST],
                 ))
 
-    def reset(self):
-        """Reset state between videos."""
-        self._prev_wrists = None
-        self._wrist_speeds.clear()
-        self._sustained.clear()
+    @staticmethod
+    def _finger_extended(lm, tip_idx: int, pip_idx: int) -> bool:
+        return lm[tip_idx].y < lm[pip_idx].y
